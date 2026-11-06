@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HANDWRITTEN</title>
+<style>
+  :root { --bg: #000; --fg: #39ff14; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+  body { display: flex; align-items: center; justify-content: center; font-family: "JetBrains Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace; }
+  #wrap { position: relative; width: min(100vw, calc(100vh * 16 / 9)); aspect-ratio: 16 / 9; }
+  canvas { width: 100%; height: 100%; display: block; }
+  #start { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; background: rgba(0,0,0,.75); }
+  #start button { font: inherit; font-size: 20px; padding: 12px 28px; background: transparent; color: var(--fg); border: 2px solid var(--fg); cursor: pointer; text-shadow: 0 0 8px var(--fg); box-shadow: 0 0 16px rgba(57,255,20,.4); }
+  #start button:hover { background: rgba(57,255,20,.12); }
+  #start p { margin: 0; opacity: .7; font-size: 14px; text-align: center; padding: 0 16px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="1280" height="720"></canvas>
+  <div id="start">
+    <button id="play">▶ PLAY  ./handwritten</button>
+    <p>A trap beat and music video made in code. Sound on.</p>
+  </div>
+</div>
+<script>
+"use strict";
+/* ============================================================
+   HANDWRITTEN — an original trap track and music video.
+   Everything (beat, scenes, lyrics) is code. No samples.
+   ============================================================ */
+
+// ---------- Timing ----------
+const BPM = 140;
+const SPB = 60 / BPM;        // seconds per beat
+const STEP = SPB / 4;        // one 16th note
+const BAR = SPB * 4;         // one bar
+const SECTIONS = [
+  { name: "intro",  label: "INTRO",   bars: 4 },
+  { name: "verse1", label: "VERSE 1", bars: 8 },
+  { name: "hook1",  label: "HOOK",    bars: 8 },
+  { name: "verse2", label: "VERSE 2", bars: 8 },
+  { name: "bridge", label: "BRIDGE",  bars: 4 },
+  { name: "hook2",  label: "HOOK",    bars: 8 },
+  { name: "outro",  label: "OUTRO",   bars: 2 },
+];
+{ let b = 0; for (const s of SECTIONS) { s.start = b; b += s.bars; } }
+const TOTAL_BARS = SECTIONS.reduce((a, s) => a + s.bars, 0);
+const SONG_END = TOTAL_BARS * BAR;
+const DURATION = SONG_END + 2.5;   // tail for reverb-like decay and fade
+
+// ---------- Lyrics (one line per bar, global bar index) ----------
+const HOOK = [
+  "Hand-written, hand-written, every line is mine",
+  "Scanner read it in a second, red flags down the spine",
+  "Hand-written, hand-written, no AI in my stack",
+  "But the AI read your stack and it found every crack",
+];
+const LYRICS = {
+  4:  "Fifteen years in vim and he never typed a prompt",
+  5:  "Calls the model fancy autocomplete, then he logs off",
+  6:  "Hand-rolled auth with a regex from oh-nine",
+  7:  "Ships it Friday night, tells the team it's fine",
+  8:  "Scared of the bot like it lives under the bed",
+  9:  "Copy-pastes answers from a thread that's been dead",
+  10: "Reviews his own PR, then approves it again",
+  11: "\"Hand-written,\" he says, like that ever made it safe",
+  20: "Now it's twenty-twenty-six and the models read old code",
+  21: "Found a buffer overflow in a lib from oh-four",
+  22: "Your passwords hashed in MD5, that's a museum piece",
+  23: "Your SQL is glued from strings, injection on release",
+  24: "You said the bot can't code, but it reads real well",
+  25: "Forty findings in a second while you're stuck in your shell",
+  26: "Hand-written never meant secure, it just meant slow",
+  27: "Pick the tool up, patch it, before the bad guys know",
+  28: "It's not here to replace you",
+  29: "It's here to read what you wrote",
+  30: "Review it with the machine",
+  31: "Then ship it. Secure.",
+  40: "Hand-written... and reviewed.",
+};
+for (const s of ["hook1", "hook2"]) {
+  const st = SECTIONS.find(x => x.name === s).start;
+  for (let i = 0; i < 8; i++) LYRICS[st + i] = HOOK[i % 4];
+}
+
+// ---------- Music theory ----------
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+// Am - F - G - E (A harmonic minor), one chord per bar
+const BASS = [33, 29, 31, 28];                       // MIDI roots for the 808 (A1 F1 G1 E1)
+const CHORDS = [[69, 72, 76], [65, 69, 72], [67, 71, 74], [64, 68, 71]];
+const ARP_STEPS = [0, 3, 6, 10, 12, 14];
+const ARP_IDX   = [0, 2, 1, 2, 0, 1];
+
+// ---------- Build the full event list (shared by audio and visuals) ----------
+function buildEvents() {
+  const ev = [];
+  const add = (t, type, p = {}) => ev.push(Object.assign({ t, type }, p));
+  for (const sec of SECTIONS) {
+    for (let i = 0; i < sec.bars; i++) {
+      const gb = sec.start + i;
+      const t0 = gb * BAR;
+      const ci = gb % 4;
+      const chord = CHORDS[ci];
+      const root = BASS[ci];
+      const n = sec.name;
+      const drums = n === "verse1" || n === "verse2" || n === "hook1" || n === "hook2";
+      const hook = n.startsWith("hook");
+
+      // Pad on every bar
+      add(t0, "pad", { notes: chord.map(m => m - 12), dur: BAR, vol: n === "bridge" ? 0.07 : 0.045 });
+
+      // Impact on drops
+      if (i === 0 && (drums || n === "outro")) add(t0, "impact");
+
+      // Bell arpeggio
+      const bellOn = n === "intro" || hook || n === "outro" || (drums && i % 2 === 0) || n === "bridge";
+      if (bellOn) {
+        ARP_STEPS.forEach((s, k) => {
+          let m = chord[ARP_IDX[k]] + (hook && k === 4 ? 12 : 0);
+          add(t0 + s * STEP, "bell", { f: mtof(m), dur: 0.6, vol: n === "intro" ? 0.09 : 0.12, lp: n === "intro" ? 1400 + i * 900 : 6000 });
+        });
+      }
+      // Hook lead: a dark square line on top
+      if (hook) {
+        const lead = [chord[2] + 12, chord[1] + 12, chord[0] + 12, chord[1] + 12];
+        lead.forEach((m, k) => add(t0 + k * SPB, "lead", { f: mtof(m), dur: SPB * 0.9 }));
+      }
+
+      if (drums) {
+        // 808 pattern
+        const pat = i % 2 === 0 ? [[0, 0], [10, 0]] : [[0, 0], [3, 0], [10, 0], [14, 7]];
+        pat.forEach(([s, semi], k) => {
+          const next = k + 1 < pat.length ? pat[k + 1][0] : 16;
+          add(t0 + s * STEP, "kick", { f: mtof(root + semi), dur: Math.min(1.1, (next - s) * STEP + 0.05) });
+        });
+        // Snare + clap on beat 3 (half-time)
+        add(t0 + 8 * STEP, "snare");
+        if (hook) add(t0 + 8 * STEP, "clap");
+        if (i % 4 === 3) add(t0 + 15 * STEP, "snare", { vol: 0.35 });
+        // Hi-hats with trap rolls
+        const roll = i % 2 === 1;
+        const every = hook ? 1 : 2;
+        for (let s = 0; s < 16; s += every) {
+          if (roll && s >= 12) break;
+          add(t0 + s * STEP, "hat", { vol: s % 4 === 0 ? 0.32 : 0.2, pan: (s % 4 === 2 ? 0.3 : -0.2) });
+        }
+        if (roll) {
+          const hits = hook ? 8 : 6;            // 32nds in the hook, triplets in verses
+          for (let k = 0; k < hits; k++) add(t0 + 12 * STEP + k * (SPB / hits), "hat", { vol: 0.12 + 0.03 * k, pan: k % 2 ? 0.4 : -0.4 });
+        }
+        if (i % 4 === 2) add(t0 + 6 * STEP, "hat", { open: true, vol: 0.2 });
+      }
+
+      if (n === "intro" && i >= 2) {
+        for (let s = 0; s < 16; s += 2) add(t0 + s * STEP, "hat", { vol: 0.08 + i * 0.03, pan: 0 });
+      }
+      if (n === "intro" && i === 3) add(t0, "riser", { dur: BAR });
+      if (n === "bridge") {
+        for (let s = 0; s < 16; s += 2) add(t0 + s * STEP, "blip", { f: s % 4 === 0 ? 1760 : 1320 });
+        for (let s = 0; s < 16; s += 4) add(t0 + s * STEP, "hat", { vol: 0.14, pan: 0 });
+        if (i === 2) add(t0, "riser", { dur: BAR * 2 });
+      }
+      if ((n === "verse1" || n === "verse2") && i === 7) add(t0 + BAR / 2, "riser", { dur: BAR / 2 });
+    }
+  }
+  // Final 808 note that rings out
+  add(SONG_END, "kick", { f: mtof(33), dur: 2.2 });
+  add(SONG_END, "pad", { notes: CHORDS[0].map(m => m - 12), dur: 2.4, vol: 0.05 });
+  ev.sort((a, b) => a.t - b.t);
+  return ev;
+}
+const EVENTS = buildEvents();
+const timesOf = type => EVENTS.filter(e => e.type === type).map(e => e.t);
+const KICKS = timesOf("kick"), SNARES = timesOf("snare"), HATS = timesOf("hat"), BELLS = timesOf("bell");
+
+// ---------- Audio engine (works with AudioContext and OfflineAudioContext) ----------
+function makeNoise(ctx) {
+  const len = ctx.sampleRate * 2;
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  let s = 12345;
+  for (let i = 0; i < len; i++) { s = (s * 16807) % 2147483647; d[i] = (s / 2147483647) * 2 - 1; }
+  return buf;
+}
+function driveCurve(k) {
+  const n = 2048, c = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const x = (i / (n - 1)) * 2 - 1; c[i] = Math.tanh(k * x) / Math.tanh(k); }
+  return c;
+}
+
+function scheduleSong(ctx, offset) {
+  const noise = makeNoise(ctx);
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 5; comp.attack.value = 0.003; comp.release.value = 0.15;
+  const master = ctx.createGain(); master.gain.value = 0.7;
+  comp.connect(master); master.connect(ctx.destination);
+  // 808 bus with saturation
+  const shaper = ctx.createWaveShaper(); shaper.curve = driveCurve(2.5); shaper.oversample = "2x";
+  const bus808 = ctx.createGain(); bus808.gain.value = 0.55;
+  shaper.connect(bus808); bus808.connect(comp);
+  // Simple echo send for bells and lead
+  const delay = ctx.createDelay(1); delay.delayTime.value = SPB * 0.75;
+  const fb = ctx.createGain(); fb.gain.value = 0.32;
+  const wet = ctx.createGain(); wet.gain.value = 0.35;
+  const dlp = ctx.createBiquadFilter(); dlp.type = "lowpass"; dlp.frequency.value = 3000;
+  delay.connect(dlp); dlp.connect(fb); fb.connect(delay); dlp.connect(wet); wet.connect(comp);
+
+  let ni = 0;
+  const noiseSrc = (t) => { const s = ctx.createBufferSource(); s.buffer = noise; s.loop = true; s.start(t, ((ni++ * 0.137) % 1.8)); return s; };
+  const env = (param, t, peak, attack, decay) => {
+    param.setValueAtTime(0.0001, t);
+    param.exponentialRampToValueAtTime(peak, t + attack);
+    param.exponentialRampToValueAtTime(0.0001, t + attack + decay);
+  };
+
+  for (const e of EVENTS) {
+    const t = e.t + offset;
+    switch (e.type) {
+      case "kick": {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.frequency.setValueAtTime(e.f * 5, t);
+        o.frequency.exponentialRampToValueAtTime(e.f, t + 0.07);
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(1, t + 0.004);
+        g.gain.setValueAtTime(1, t + Math.max(0.01, e.dur * 0.55));
+        g.gain.exponentialRampToValueAtTime(0.0001, t + e.dur);
+        o.connect(g); g.connect(shaper);
+        o.start(t); o.stop(t + e.dur + 0.05);
+        // click on top
+        const c = ctx.createOscillator(), cg = ctx.createGain();
+        c.type = "triangle"; c.frequency.setValueAtTime(1800, t); c.frequency.exponentialRampToValueAtTime(80, t + 0.02);
+        env(cg.gain, t, 0.35, 0.001, 0.03); c.connect(cg); cg.connect(comp); c.start(t); c.stop(t + 0.06);
+        break;
+      }
+      case "snare": {
+        const v = e.vol || 0.7;
+        const s = noiseSrc(t), hp = ctx.createBiquadFilter(), g = ctx.createGain();
+        hp.type = "highpass"; hp.frequency.value = 1400;
+        env(g.gain, t, v, 0.002, 0.2); s.connect(hp); hp.connect(g); g.connect(comp); s.stop(t + 0.3);
+        const o = ctx.createOscillator(), og = ctx.createGain();
+        o.type = "triangle"; o.frequency.setValueAtTime(220, t); o.frequency.exponentialRampToValueAtTime(150, t + 0.08);
+        env(og.gain, t, v * 0.6, 0.001, 0.09); o.connect(og); og.connect(comp); o.start(t); o.stop(t + 0.15);
+        break;
+      }
+      case "clap": {
+        const s = noiseSrc(t), bp = ctx.createBiquadFilter(), g = ctx.createGain();
+        bp.type = "bandpass"; bp.frequency.value = 1500; bp.Q.value = 1.2;
+        g.gain.setValueAtTime(0.0001, t);
+        for (let k = 0; k < 3; k++) { g.gain.setValueAtTime(0.5, t + k * 0.011); g.gain.exponentialRampToValueAtTime(0.05, t + k * 0.011 + 0.009); }
+        g.gain.setValueAtTime(0.45, t + 0.034); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+        s.connect(bp); bp.connect(g); g.connect(comp); s.stop(t + 0.3);
+        break;
+      }
+      case "hat": {
+        const s = noiseSrc(t), hp = ctx.createBiquadFilter(), g = ctx.createGain(), p = ctx.createStereoPanner();
+        hp.type = "highpass"; hp.frequency.value = 7500; p.pan.value = e.pan || 0;
+        env(g.gain, t, e.vol || 0.2, 0.001, e.open ? 0.28 : 0.035);
+        s.connect(hp); hp.connect(g); g.connect(p); p.connect(comp); s.stop(t + (e.open ? 0.35 : 0.08));
+        break;
+      }
+      case "bell": {
+        const c = ctx.createOscillator(), m = ctx.createOscillator(), mg = ctx.createGain(), g = ctx.createGain(), lp = ctx.createBiquadFilter();
+        c.frequency.value = e.f; m.frequency.value = e.f * 3.5;
+        mg.gain.setValueAtTime(e.f * 2.2, t); mg.gain.exponentialRampToValueAtTime(e.f * 0.05, t + e.dur);
+        lp.type = "lowpass"; lp.frequency.value = e.lp || 6000;
+        env(g.gain, t, e.vol, 0.002, e.dur);
+        m.connect(mg); mg.connect(c.frequency); c.connect(g); g.connect(lp); lp.connect(comp); lp.connect(delay);
+        c.start(t); m.start(t); c.stop(t + e.dur + 0.05); m.stop(t + e.dur + 0.05);
+        break;
+      }
+      case "lead": {
+        const o = ctx.createOscillator(), o2 = ctx.createOscillator(), g = ctx.createGain(), lp = ctx.createBiquadFilter();
+        o.type = "square"; o2.type = "sawtooth"; o.frequency.value = e.f; o2.frequency.value = e.f * 1.006;
+        lp.type = "lowpass"; lp.frequency.setValueAtTime(2600, t); lp.frequency.exponentialRampToValueAtTime(700, t + e.dur); lp.Q.value = 6;
+        g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.045, t + 0.01);
+        g.gain.setValueAtTime(0.045, t + e.dur * 0.7); g.gain.exponentialRampToValueAtTime(0.0001, t + e.dur);
+        o.connect(lp); o2.connect(lp); lp.connect(g); g.connect(comp); g.connect(delay);
+        o.start(t); o2.start(t); o.stop(t + e.dur + 0.05); o2.stop(t + e.dur + 0.05);
+        break;
+      }
+      case "pad": {
+        const lp = ctx.createBiquadFilter(), g = ctx.createGain();
+        lp.type = "lowpass"; lp.frequency.value = 900; lp.Q.value = 2;
+        g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(e.vol, t + 0.35);
+        g.gain.setValueAtTime(e.vol, t + e.dur - 0.2); g.gain.exponentialRampToValueAtTime(0.0001, t + e.dur + 0.15);
+        lp.connect(g); g.connect(comp);
+        for (const m of e.notes) for (const d of [-7, 7]) {
+          const o = ctx.createOscillator(); o.type = "sawtooth"; o.frequency.value = mtof(m); o.detune.value = d;
+          o.connect(lp); o.start(t); o.stop(t + e.dur + 0.2);
+        }
+        break;
+      }
+      case "riser": {
+        const s = noiseSrc(t), bp = ctx.createBiquadFilter(), g = ctx.createGain();
+        bp.type = "bandpass"; bp.Q.value = 4;
+        bp.frequency.setValueAtTime(300, t); bp.frequency.exponentialRampToValueAtTime(9000, t + e.dur);
+        g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.35, t + e.dur); g.gain.linearRampToValueAtTime(0, t + e.dur + 0.02);
+        s.connect(bp); bp.connect(g); g.connect(comp); s.stop(t + e.dur + 0.05);
+        break;
+      }
+      case "blip": {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = e.f; env(g.gain, t, 0.06, 0.002, 0.05);
+        o.connect(g); g.connect(comp); g.connect(delay); o.start(t); o.stop(t + 0.1);
+        break;
+      }
+      case "impact": {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.frequency.setValueAtTime(90, t); o.frequency.exponentialRampToValueAtTime(28, t + 1.4);
+        env(g.gain, t, 0.5, 0.005, 1.4); o.connect(g); g.connect(comp); o.start(t); o.stop(t + 1.5);
+        const s = noiseSrc(t), lp = ctx.createBiquadFilter(), ng = ctx.createGain();
+        lp.type = "lowpass"; lp.frequency.setValueAtTime(5000, t); lp.frequency.exponentialRampToValueAtTime(200, t + 0.8);
+        env(ng.gain, t, 0.3, 0.002, 0.8); s.connect(lp); lp.connect(ng); ng.connect(comp); s.stop(t + 0.9);
+        break;
+      }
+    }
+  }
+}
+
+// ---------- WAV export (for the MP4 render) ----------
+async function renderWav() {
+  const sr = 44100;
+  const ctx = new OfflineAudioContext(2, Math.ceil(sr * DURATION), sr);
+  scheduleSong(ctx, 0);
+  const buf = await ctx.startRendering();
+  const L = buf.getChannelData(0), R = buf.getChannelData(1), n = buf.length;
+  // fade the last 1.5 s
+  const fadeN = Math.floor(sr * 1.5);
+  for (let i = n - fadeN; i < n; i++) { const k = (n - i) / fadeN; L[i] *= k; R[i] *= k; }
+  const ab = new ArrayBuffer(44 + n * 4), v = new DataView(ab);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); v.setUint32(4, 36 + n * 4, true); ws(8, "WAVE"); ws(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true); ws(36, "data"); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) {
+    v.setInt16(o, Math.max(-1, Math.min(1, L[i])) * 32767, true);
+    v.setInt16(o + 2, Math.max(-1, Math.min(1, R[i])) * 32767, true);
+    o += 4;
+  }
+  const bytes = new Uint8Array(ab);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+// ============================================================
+//  VISUALS — drawFrame(t) is a pure function of time
+// ============================================================
+const W = 1280, H = 720;
+const cv = document.getElementById("c");
+const g = cv.getContext("2d");
+const MONO = '"JetBrains Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace';
+const GREEN = "#39ff14", RED = "#ff2d55", AMBER = "#ffcc00", CYAN = "#00e5ff";
+const font = (px, w = 400) => `${w} ${px}px ${MONO}`;
+
+function hash(a, b) {
+  let h = (a * 374761393 + b * 668265263) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+}
+function lastBefore(arr, t) {
+  let lo = 0, hi = arr.length - 1, r = -1;
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m] <= t) { r = m; lo = m + 1; } else hi = m - 1; }
+  return r < 0 ? -1e9 : arr[r];
+}
+const envAt = (arr, t, rate) => Math.exp(-(t - lastBefore(arr, t)) * rate);
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+
+function sectionAt(t) {
+  const gb = Math.floor(t / BAR);
+  let sec = SECTIONS[SECTIONS.length - 1];
+  for (const s of SECTIONS) if (gb >= s.start && gb < s.start + s.bars) { sec = s; break; }
+  const local = t - sec.start * BAR;
+  return { sec, gb, bar: Math.floor(local / BAR), local, barT: t - gb * BAR };
+}
+
+// Pre-rendered overlays
+const scan = document.createElement("canvas"); scan.width = W; scan.height = H;
+{ const s = scan.getContext("2d"); s.fillStyle = "rgba(0,0,0,0.28)"; for (let y = 0; y < H; y += 3) s.fillRect(0, y, W, 1);
+  const v = s.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.95);
+  v.addColorStop(0, "rgba(0,0,0,0)"); v.addColorStop(1, "rgba(0,0,0,0.8)"); s.fillStyle = v; s.fillRect(0, 0, W, H); }
+
+function glowText(txt, x, y, color = GREEN, blur = 12) {
+  g.shadowColor = color; g.shadowBlur = blur; g.fillStyle = color; g.fillText(txt, x, y); g.shadowBlur = 0;
+}
+function rgbSplit(txt, x, y, amt) {
+  g.save(); g.globalCompositeOperation = "lighter";
+  g.fillStyle = "rgba(255,0,60,0.8)"; g.fillText(txt, x - amt, y);
+  g.fillStyle = "rgba(0,229,255,0.8)"; g.fillText(txt, x + amt, y);
+  g.restore();
+  glowText(txt, x, y, GREEN, 24);
+}
+function windowBox(x, y, w, h, title, color = GREEN) {
+  g.fillStyle = "rgba(0,10,2,0.88)"; g.fillRect(x, y, w, h);
+  g.shadowColor = color; g.shadowBlur = 14; g.strokeStyle = color; g.lineWidth = 2; g.strokeRect(x, y, w, h); g.shadowBlur = 0;
+  g.fillStyle = color; g.globalAlpha = 0.15; g.fillRect(x, y, w, 30); g.globalAlpha = 1;
+  g.fillStyle = color; for (let i = 0; i < 3; i++) { g.beginPath(); g.arc(x + 18 + i * 20, y + 15, 5, 0, 7); g.fill(); }
+  g.font = font(15); g.textAlign = "center"; g.fillText(title, x + w / 2, y + 20); g.textAlign = "left";
+}
+// Typewriter: reveals lines with a total char budget
+function typeLines(lines, x, y, lh, chars, opts = {}) {
+  let left = Math.max(0, chars), cy = y, cursor = null;
+  for (const ln of lines) {
+    const text = typeof ln === "string" ? ln : ln.t;
+    const color = typeof ln === "string" ? (text.startsWith("$") ? GREEN : "#b6ffa8") : ln.c;
+    if (left <= 0) break;
+    const shown = text.slice(0, left);
+    left -= text.length + (opts.pause || 8);
+    g.fillStyle = color; g.fillText(shown, x, cy);
+    cursor = [x + g.measureText(shown).width + 2, cy];
+    cy += lh;
+  }
+  return cursor;
+}
+function cursorAt(c, t) { if (c && Math.floor(t * 3) % 2 === 0) { g.fillStyle = GREEN; g.fillRect(c[0], c[1] - 18, 11, 22); } }
+
+function drawRain(t, alpha) {
+  const CH = "01{}[]()<>=;$#&|!?/*+-~xyz";
+  g.font = font(16);
+  for (let i = 0; i < 46; i++) {
+    const x = i * (W / 46) + 6, sp = 50 + hash(i, 1) * 150;
+    const head = ((t * sp + hash(i, 2) * 1400) % (H + 260)) - 60;
+    for (let j = 0; j < 11; j++) {
+      const y = head - j * 19; if (y < 0 || y > H) continue;
+      const c = CH[Math.floor(hash(i * 31 + j, Math.floor(t * 7)) * CH.length)];
+      g.fillStyle = `rgba(57,255,20,${(j === 0 ? 0.45 : 0.16 * (1 - j / 11)) * alpha})`;
+      g.fillText(c, x, y);
+    }
+  }
+}
+
+function drawHUD(t, info, k) {
+  g.font = font(14, 700);
+  g.fillStyle = Math.floor(t * 2) % 2 ? RED : "#550010"; g.beginPath(); g.arc(34, 30, 6, 0, 7); g.fill();
+  g.fillStyle = GREEN; g.fillText("REC  HANDWRITTEN.exe", 48, 35);
+  const mm = String(Math.floor(t / 60)).padStart(2, "0"), ss = String(Math.floor(t % 60)).padStart(2, "0"), ff = String(Math.floor((t % 1) * 30)).padStart(2, "0");
+  g.textAlign = "right"; g.fillText(`${BPM} BPM   ${mm}:${ss}:${ff}`, W - 28, 35); g.textAlign = "left";
+  g.fillStyle = "rgba(57,255,20,0.7)"; g.fillText(`[${info.sec.label}]  bar ${String(info.gb + 1).padStart(2, "0")}/${TOTAL_BARS}`, 28, H - 22);
+  // beat dots
+  const beat = Math.floor(info.barT / SPB);
+  for (let b = 0; b < 4; b++) { g.fillStyle = b === beat ? GREEN : "rgba(57,255,20,0.2)"; g.fillRect(W - 120 + b * 22, H - 34, 14, 14); }
+}
+
+function drawViz(t, k, hatE) {
+  const n = 48, bw = W / n;
+  for (let i = 0; i < n; i++) {
+    const mid = 1 - Math.abs(i - n / 2) / (n / 2);
+    const h = 4 + (k * (0.4 + mid * 0.8) + hatE * 0.35 * hash(i, 9)) * (20 + hash(i, Math.floor(t * 15)) * 60);
+    g.fillStyle = `rgba(57,255,20,${0.12 + 0.35 * mid})`;
+    g.fillRect(i * bw + 2, H - 52 - h, bw - 4, h);
+  }
+}
+
+function drawLyric(info) {
+  const line = LYRICS[info.gb];
+  if (!line) return;
+  const words = line.split(" ");
+  const prog = clamp(info.barT / (BAR * 0.55));
+  const n = Math.max(1, Math.ceil(words.length * prog));
+  g.font = font(32, 800);
+  const full = g.measureText(line).width;
+  const scale = Math.min(1, (W - 80) / full);
+  g.save(); g.translate(W / 2, 640); g.scale(scale, scale);
+  g.fillStyle = "rgba(0,0,0,0.7)"; g.fillRect(-full / 2 - 20, -40, full + 40, 56);
+  let x = -full / 2;
+  words.forEach((w, i) => {
+    const ww = g.measureText(w + " ").width;
+    if (i < n) {
+      const pop = i === n - 1 ? 1 + 0.12 * (1 - (prog * words.length - i) % 1) : 1;
+      g.save(); g.translate(x, 0); g.scale(pop, pop);
+      glowText(w, 0, 0, i === n - 1 ? "#eaffdf" : GREEN, i === n - 1 ? 18 : 8);
+      g.restore();
+    } else { g.fillStyle = "rgba(57,255,20,0.18)"; g.fillText(w, x, 0); }
+    x += ww;
+  });
+  g.restore();
+}
+
+// ---------- Scenes ----------
+const INTRO_LINES = [
+  "$ ssh dev@legacy-prod",
+  { t: "Last login: Tue Mar 3 2009 from the office printer", c: "#7fbf70" },
+  "$ whoami",
+  { t: "senior_dev   # 15 yrs. zero AI. \"real devs type.\"", c: "#b6ffa8" },
+  "$ ls ~/ai_tools",
+  { t: "ls: cannot access '~/ai_tools': refused on principle", c: AMBER },
+  "$ ./play handwritten.wav",
+];
+const CODE = [
+  { t: "// auth.php  written by hand. no AI. since 2009.", c: "#5f9f55" },
+  { t: "$q = \"SELECT * FROM users WHERE name='\" . $_GET['u'] . \"'\";", c: "#b6ffa8" },
+  { t: "$hash = md5($_POST['password']);", c: "#b6ffa8" },
+  { t: "if ($hash == $row['pw']) { login($row); }", c: "#b6ffa8" },
+  { t: "eval($_POST['cfg']);            // trust me", c: "#b6ffa8" },
+  { t: "$secret = \"admin123\";           // temporary", c: "#b6ffa8" },
+  { t: "// TODO: add tests (2011)", c: "#5f9f55" },
+  { t: "// TODO: remove TODOs", c: "#5f9f55" },
+];
+const FINDINGS = [
+  ["CRIT", "auth.php:2", "SQL injection: query glued from strings"],
+  ["CRIT", "auth.php:5", "eval() on user input"],
+  ["HIGH", "auth.php:3", "MD5 password hash, no salt"],
+  ["HIGH", "util.c:88 ", "strcpy() with no bounds check"],
+  ["HIGH", "auth.php:6", "hard-coded secret \"admin123\""],
+  ["MED ", "auth.php:4", "loose == compare on hashes"],
+  ["MED ", "cron.sh:12", "rm -rf $DIR/ when DIR is empty"],
+  ["LOW ", "README:1  ", "claims \"this code is secure\""],
+];
+const SEV = { "CRIT": RED, "HIGH": "#ff7a3d", "MED ": AMBER, "LOW ": CYAN };
+const PATCH = [
+  { t: "- $q = \"SELECT ... '\" . $_GET['u'] . \"'\";", c: RED },
+  { t: "+ $st = $db->prepare('SELECT * FROM users WHERE name = ?');", c: GREEN },
+  { t: "- $hash = md5($_POST['password']);", c: RED },
+  { t: "+ $ok = password_verify($_POST['password'], $row['pw']);", c: GREEN },
+  { t: "- eval($_POST['cfg']);", c: RED },
+  { t: "+ $cfg = json_decode($_POST['cfg'], true);", c: GREEN },
+  { t: "- $secret = \"admin123\";", c: RED },
+  { t: "+ $secret = getenv('APP_SECRET');", c: GREEN },
+];
+
+function sceneIntro(t, info) {
+  windowBox(140, 90, 1000, 400, "tty1 — legacy-prod");
+  g.font = font(22);
+  const c = typeLines(INTRO_LINES, 170, 160, 42, (info.local - 0.2) * 34, { pause: 10 });
+  cursorAt(c, t);
+  if (info.bar >= 3) {
+    const a = clamp((info.barT) / 0.6);
+    g.globalAlpha = a; g.font = font(26, 800); g.textAlign = "center";
+    glowText("an original track — made in code", W / 2, 560); g.textAlign = "left"; g.globalAlpha = 1;
+  }
+}
+
+function sceneEditor(t, info, k) {
+  windowBox(110, 80, 1060, 470, "auth.php — hand-written, 100% organic");
+  g.font = font(20);
+  const shown = Math.min(CODE.length, info.bar + 1);
+  for (let i = 0; i < shown; i++) {
+    const age = i === info.bar ? info.barT : 99;
+    const chars = Math.floor(age * 40);
+    g.fillStyle = "rgba(57,255,20,0.35)"; g.fillText(String(i + 1).padStart(2, " "), 130, 150 + i * 40);
+    const ln = CODE[i];
+    g.fillStyle = ln.c; const txt = ln.t.slice(0, chars); g.fillText(txt, 180, 150 + i * 40);
+    if (i === shown - 1) cursorAt([180 + g.measureText(txt).width + 2, 150 + i * 40], t);
+  }
+  // status bar
+  g.fillStyle = "rgba(57,255,20,0.12)"; g.fillRect(112, 512, 1056, 36);
+  g.font = font(15, 700); g.fillStyle = GREEN;
+  const keys = (1204331 + Math.floor(info.local * 37)).toLocaleString("en-US");
+  g.fillText(`AI used: 0%   tests: 0   reviewers: 0   keystrokes: ${keys}   coffee: ${3 + info.bar}`, 130, 536);
+}
+
+function sceneHook(t, info, k, s, hook2) {
+  const shake = (hash(Math.floor(t * 30), 3) - 0.5) * 10 * k;
+  g.font = font(128, 800); g.textAlign = "center";
+  const sc = 1 + 0.06 * k;
+  g.save(); g.translate(W / 2 + shake, 250); g.scale(sc, sc);
+  rgbSplit("HAND-WRITTEN", 0, 0, 3 + 10 * s);
+  g.restore();
+  g.font = font(30, 700);
+  if (hook2) glowText(`100% human.  ${FINDINGS.length * 6 - 1} findings.`, W / 2, 320, RED, 16);
+  else glowText("100% human.  0% reviewed.", W / 2, 320, GREEN, 12);
+  g.textAlign = "left";
+  // PR card
+  if (info.bar >= 2) {
+    const a = clamp((info.local - 2 * BAR) / 0.4);
+    g.globalAlpha = a;
+    windowBox(300, 360, 680, 210, "pull request", hook2 ? RED : GREEN);
+    g.font = font(20, 700); g.fillStyle = "#eaffdf"; g.fillText("#1337  auth-final-FINAL-v2", 330, 420);
+    g.font = font(18);
+    const rows = hook2
+      ? [["AI review:", "47 issues  ✖  changes requested", RED], ["Human review:", "\"looks fine to me\"", AMBER], ["Status:", "blocked until patched", RED]]
+      : [["Reviewers:", "(none)", AMBER], ["Approved by:", "the author  ✔", GREEN], ["Merged:", "Friday 23:58", GREEN]];
+    rows.forEach(([a1, b1, c1], i) => { g.fillStyle = "#7fbf70"; g.fillText(a1, 330, 465 + i * 32); g.fillStyle = c1; g.fillText(b1, 520, 465 + i * 32); });
+    g.globalAlpha = 1;
+  }
+}
+
+function sceneScanner(t, info, k) {
+  windowBox(90, 70, 1100, 490, "ai-review --deep ./human_code", GREEN);
+  g.font = font(18);
+  const files = Math.min(1204, Math.floor(info.local * 900));
+  const secs = Math.min(0.8, info.local * 0.06).toFixed(1);
+  g.fillStyle = "#b6ffa8";
+  g.fillText(`files read: ${files.toLocaleString("en-US")}/1,204    time: ${secs}s    model: reading human code...`, 120, 128);
+  // scan bar
+  const sx = 120 + ((info.local * 400) % 1040);
+  g.fillStyle = "rgba(57,255,20,0.25)"; g.fillRect(120, 140, 1040, 4); g.fillStyle = GREEN; g.fillRect(sx, 138, 40, 8);
+  const shown = Math.min(FINDINGS.length, info.bar + 1);
+  for (let i = 0; i < shown; i++) {
+    const [sev, loc, msg] = FINDINGS[i];
+    const y = 190 + i * 40;
+    const fresh = i === info.bar ? Math.exp(-info.barT * 3) : 0;
+    if (fresh > 0.02) { g.fillStyle = `rgba(255,45,85,${0.35 * fresh})`; g.fillRect(112, y - 26, 1056, 36); }
+    g.font = font(18, 800); g.fillStyle = SEV[sev]; g.fillText(`[${sev}]`, 120, y);
+    g.font = font(18); g.fillStyle = "#eaffdf"; g.fillText(loc, 220, y);
+    g.fillStyle = "#b6ffa8"; g.fillText(msg.slice(0, Math.floor((i === info.bar ? info.barT : 9) * 45)), 360, y);
+  }
+  // counter box
+  g.font = font(16, 700); g.fillStyle = AMBER; g.fillText("HUMAN REVIEW TIME: 15 years", 120, 540);
+  g.fillStyle = GREEN; g.fillText(`MACHINE REVIEW TIME: ${secs} s`, 520, 540);
+  g.fillStyle = RED; g.fillText(`FINDINGS: ${shown * 6 - (shown === 8 ? 1 : 0)}`, 930, 540);
+}
+
+function scenePatch(t, info, k) {
+  windowBox(140, 70, 1000, 420, "patch --with-help  (human + AI review)");
+  g.font = font(18);
+  const half = Math.floor(info.local / (BAR / 2));
+  const shown = Math.min(PATCH.length, half + 1);
+  for (let i = 0; i < shown; i++) { g.fillStyle = PATCH[i].c; g.fillText(PATCH[i].t, 170, 130 + i * 38); }
+  const p = clamp(info.local / (BAR * 4));
+  g.strokeStyle = GREEN; g.strokeRect(170, 440, 940, 22); g.fillStyle = GREEN; g.fillRect(172, 442, 936 * p, 18);
+  g.font = font(16, 700); g.fillText(`PATCHING ${Math.floor(p * 100)}%`, 170, 432);
+  g.font = font(24, 800); g.textAlign = "center";
+  glowText("the AI is not the enemy.  unread code is.", W / 2, 540, "#eaffdf", 14);
+  g.textAlign = "left";
+}
+
+function sceneOutro(t, info) {
+  windowBox(140, 110, 1000, 300, "tty1 — legacy-prod");
+  g.font = font(22);
+  const lines = [
+    "$ git commit -am \"fixed it. with help.\"",
+    { t: "[main 7e57ed] 6 files changed, 31 insertions(+), 47 issues(-)", c: "#b6ffa8" },
+    "$ git push",
+    { t: "CI: all checks passed ✔   reviewers: human + machine", c: GREEN },
+  ];
+  cursorAt(typeLines(lines, 170, 180, 46, info.local * 45), t);
+  if (info.local > BAR * 0.9) {
+    g.globalAlpha = clamp((info.local - BAR * 0.9) / 0.5);
+    g.font = font(72, 800); g.textAlign = "center"; rgbSplit("HANDWRITTEN", W / 2, 520, 2);
+    g.font = font(18); glowText("beat, video and lyrics written in code", W / 2, 560, "#b6ffa8", 6);
+    g.textAlign = "left"; g.globalAlpha = 1;
+  }
+}
+
+function drawFrame(t) {
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.fillStyle = "#010402"; g.fillRect(0, 0, W, H);
+  if (t >= DURATION) return;
+  const info = sectionAt(Math.min(t, SONG_END - 0.001));
+  const k = t < SONG_END ? envAt(KICKS, t, 7) : 0;
+  const s = envAt(SNARES, t, 9);
+  const hatE = envAt(HATS, t, 25);
+  const name = t >= SONG_END ? "end" : info.sec.name;
+
+  drawRain(t, name === "intro" ? 0.6 : 0.9 + k * 0.6);
+
+  // camera pump on the 808
+  g.save();
+  const z = 1 + 0.018 * k;
+  g.translate(W / 2, H / 2); g.scale(z, z); g.translate(-W / 2, -H / 2);
+  if (name === "intro") sceneIntro(t, info);
+  else if (name === "verse1") sceneEditor(t, info, k);
+  else if (name === "hook1" || name === "hook2") sceneHook(t, info, k, s, name === "hook2");
+  else if (name === "verse2") sceneScanner(t, info, k);
+  else if (name === "bridge") scenePatch(t, info, k);
+  else if (name === "outro" || name === "end") sceneOutro(t, t >= SONG_END ? Object.assign({}, info, { local: t - SECTIONS[6].start * BAR }) : info);
+  g.restore();
+
+  if (name !== "intro" && name !== "end") drawViz(t, k, hatE);
+  if (t < SONG_END) drawLyric(info);
+
+  // glitch slices on snares in hooks and verse 2
+  if ((name.startsWith("hook") || name === "verse2") && s > 0.35) {
+    for (let i = 0; i < 6; i++) {
+      const y = Math.floor(hash(i, Math.floor(t * 40)) * H), h = 6 + hash(i, 5) * 30;
+      const dx = (hash(i, Math.floor(t * 60)) - 0.5) * 60 * s;
+      g.drawImage(cv, 0, y, W, h, dx, y, W, h);
+    }
+  }
+  // drop flash
+  const sinceSec = info.local;
+  if (sinceSec < 0.35 && name !== "intro" && t < SONG_END) { g.fillStyle = `rgba(57,255,20,${0.35 * (1 - sinceSec / 0.35)})`; g.fillRect(0, 0, W, H); }
+  if (t < SONG_END) drawHUD(t, info, k);
+  g.drawImage(scan, 0, 0);
+  // fade in and fade out
+  const fade = Math.min(clamp(t / 0.8), clamp((DURATION - t) / 1.5));
+  if (fade < 1) { g.fillStyle = `rgba(0,0,0,${1 - fade})`; g.fillRect(0, 0, W, H); }
+}
+
+// ---------- Player ----------
+let actx = null, t0 = 0, raf = 0;
+function loop() {
+  const t = actx.currentTime - t0;
+  drawFrame(t);
+  if (t < DURATION) raf = requestAnimationFrame(loop);
+  else { document.getElementById("start").classList.remove("hidden"); document.getElementById("play").textContent = "↻ PLAY AGAIN"; }
+}
+document.getElementById("play").addEventListener("click", async () => {
+  if (actx) { cancelAnimationFrame(raf); await actx.close(); }
+  actx = new AudioContext();
+  t0 = actx.currentTime + 0.15;
+  scheduleSong(actx, t0);
+  document.getElementById("start").classList.add("hidden");
+  loop();
+});
+
+// Render hooks for render.cjs
+window.HW = {
+  ready: false, duration: DURATION, renderWav,
+  frame: (t) => { drawFrame(t); return cv.toDataURL("image/jpeg", 0.92).split(",")[1]; },
+};
+document.fonts.load(font(20)).then(() => document.fonts.load(font(20, 800))).finally(() => { drawFrame(3.2); window.HW.ready = true; });
+</script>
+</body>
+</html>
